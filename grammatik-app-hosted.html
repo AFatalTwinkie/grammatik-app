@@ -371,13 +371,11 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
 
 // ── Configuration ──────────────────────────────────────────────────────────
 // Update this to your hosted backend URL (e.g., https://your-server.onrender.com)
-var BACKEND_URL = window.location.hostname === 'localhost' 
-  ? 'http://localhost:3001'
-  : 'https://your-backend-url-here.onrender.com'; // Change this when deploying
+var BACKEND_URL = 'https://grammatik-backend.onrender.com'; // Change this when deploying
 
 // ── Titles per tab ──────────────────────────────────────────────────────────
 var TAB_META = {
-  essay:     {title:'Essay',     sub:'German B1–B2 Writing Practice'},
+  essay:     {title:'Essay',     sub:'German Writing Practice'},
   listening: {title:'Listening', sub:'Upload audio and explore translinear transcripts'},
   history:   {title:'History',   sub:'All your past submissions'},
   analytics: {title:'Analytics', sub:'See where you make the most errors'},
