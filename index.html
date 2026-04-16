@@ -1065,59 +1065,99 @@ function salvagePairs(str) {
   return out;
 }
 
-// Build timing data by matching translated pairs to Whisper segments.
-// Strategy: merge Whisper segments into groups that map 1:1 with our sentence pairs.
-// We use text similarity (shared words) to find the best segment boundaries.
+// Build timing data by aligning translated pairs to Whisper segments via
+// character-stream matching. We treat the concatenation of Whisper segment
+// text as a timestamped character stream, then walk through it assigning
+// each pair's characters to real audio timestamps. This respects actual
+// speaker pauses/rate instead of assuming uniform speech.
 function buildLyricTimings(pairs) {
   lyricTimings = [];
   lastActiveLyricIdx = -1;
   if (!whisperSegments.length || !pairs.length) return;
 
-  // If segment count roughly matches pair count, do direct 1:1 mapping
-  if (whisperSegments.length === pairs.length) {
-    for (var i = 0; i < pairs.length; i++) {
-      lyricTimings.push({ startTime: whisperSegments[i].start, endTime: whisperSegments[i].end });
-    }
-    console.log('Lyric timing: direct 1:1 mapping (' + lyricTimings.length + ' lines)');
-    return;
-  }
-
-  // Otherwise, distribute segments across pairs proportionally.
-  // Each pair gets a proportional slice of the total audio duration based on its
-  // character length relative to the total transcript.
-  var totalChars = 0;
-  pairs.forEach(function(p) { totalChars += (p.de || '').length; });
-  if (totalChars === 0) return;
-
-  var totalStart = whisperSegments[0].start;
-  var totalEnd = whisperSegments[whisperSegments.length - 1].end;
-  var totalDuration = totalEnd - totalStart;
-
-  var cursor = totalStart;
-  for (var j = 0; j < pairs.length; j++) {
-    var charRatio = (pairs[j].de || '').length / totalChars;
-    var segDuration = totalDuration * charRatio;
-    var segStart = cursor;
-    var segEnd = cursor + segDuration;
-    // Snap to nearest Whisper segment boundary for accuracy
-    segEnd = snapToSegmentBoundary(segEnd);
-    if (j === pairs.length - 1) segEnd = totalEnd; // last pair gets the rest
-    lyricTimings.push({ startTime: segStart, endTime: segEnd });
-    cursor = segEnd;
-  }
-  console.log('Lyric timing: proportional mapping (' + lyricTimings.length + ' lines)');
-}
-
-function snapToSegmentBoundary(time) {
-  var closest = time;
-  var minDist = Infinity;
+  // Build a flat stream of Whisper text where each character carries the
+  // start/end time of the segment it came from.
+  var charStream = []; // [{ch, segStart, segEnd}]
   for (var i = 0; i < whisperSegments.length; i++) {
-    var d = Math.abs(whisperSegments[i].end - time);
-    if (d < minDist) { minDist = d; closest = whisperSegments[i].end; }
-    d = Math.abs(whisperSegments[i].start - time);
-    if (d < minDist) { minDist = d; closest = whisperSegments[i].start; }
+    var seg = whisperSegments[i];
+    var segText = (seg.text || '').trim();
+    for (var c = 0; c < segText.length; c++) {
+      charStream.push({ ch: segText[c], segStart: seg.start, segEnd: seg.end });
+    }
+    // Separator between segments (approximates how concatenated text flows)
+    charStream.push({ ch: ' ', segStart: seg.start, segEnd: seg.end });
   }
-  return closest;
+
+  if (!charStream.length) return;
+
+  var letterRe = /[\p{L}\p{N}]/u;
+  var spaceRe  = /\s/;
+  var lastEnd = whisperSegments[whisperSegments.length - 1].end;
+
+  // For each translated pair, find its position in the char stream by
+  // consuming roughly as many letter/digit characters as the pair contains.
+  // Punctuation and quote-style differences between Whisper and Claude's
+  // output are skipped so they don't throw off alignment.
+  var cursor = 0;
+  for (var p = 0; p < pairs.length; p++) {
+    // Count only letters/digits in the target — punctuation varies
+    // between Whisper's output and Claude's verbatim "de" field.
+    var targetRaw = pairs[p].de || '';
+    var targetLen = 0;
+    for (var t = 0; t < targetRaw.length; t++) {
+      if (letterRe.test(targetRaw[t])) targetLen++;
+    }
+
+    if (targetLen === 0) {
+      // Degenerate pair — give it a zero-width slot at the current cursor
+      var nowTime = cursor < charStream.length ? charStream[cursor].segStart : lastEnd;
+      lyricTimings.push({ startTime: nowTime, endTime: nowTime });
+      continue;
+    }
+
+    // Skip leading whitespace/punctuation in the stream
+    while (cursor < charStream.length && !letterRe.test(charStream[cursor].ch)) {
+      cursor++;
+    }
+
+    if (cursor >= charStream.length) {
+      lyricTimings.push({ startTime: lastEnd, endTime: lastEnd });
+      continue;
+    }
+
+    var startTime = charStream[cursor].segStart;
+
+    // Consume `targetLen` letter/digit chars from the stream
+    var consumed = 0;
+    var lastConsumedIdx = cursor;
+    while (cursor < charStream.length && consumed < targetLen) {
+      if (letterRe.test(charStream[cursor].ch)) {
+        consumed++;
+        lastConsumedIdx = cursor;
+      }
+      cursor++;
+    }
+
+    var endTime = charStream[lastConsumedIdx].segEnd;
+
+    // Enforce monotonic start times (small guard against odd stream jumps)
+    if (lyricTimings.length > 0) {
+      var prev = lyricTimings[lyricTimings.length - 1];
+      if (startTime < prev.startTime) startTime = prev.startTime;
+    }
+    if (endTime < startTime) endTime = startTime + 0.3;
+
+    lyricTimings.push({ startTime: startTime, endTime: endTime });
+  }
+
+  // Each line's endTime is the next line's startTime (no gaps, no overlaps).
+  // The final line extends to the true end of audio.
+  for (var m = 0; m < lyricTimings.length - 1; m++) {
+    lyricTimings[m].endTime = lyricTimings[m + 1].startTime;
+  }
+  lyricTimings[lyricTimings.length - 1].endTime = lastEnd;
+
+  console.log('Lyric timing: char-stream alignment (' + lyricTimings.length + ' lines)');
 }
 
 function renderTranscript(pairs) {
