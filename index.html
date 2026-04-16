@@ -683,28 +683,49 @@ document.getElementById('parseRssBtn').addEventListener('click', async function(
   var feedUrl = document.getElementById('rssInput').value.trim();
   if (!feedUrl) { alert('Please enter an RSS feed URL.'); return; }
   
+  // Ensure URL has protocol
+  if (!feedUrl.startsWith('http')) {
+    feedUrl = 'https://' + feedUrl;
+    document.getElementById('rssInput').value = feedUrl;
+  }
+  
   var btn = this;
   btn.textContent = 'Loading…'; btn.disabled = true;
   setStatus('rssStatus', 'info', '<span class="spin"></span>Fetching feed...');
   
   try {
-    var r = await fetch('/api/parse-podcast-feed', {
+    console.log('Sending to backend: ' + feedUrl);
+    var r = await fetch('http://localhost:3001/api/parse-podcast-feed', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({feedUrl: feedUrl})
     });
     
+    console.log('Backend response status: ' + r.status);
+    var data = await r.json();
+    console.log('Backend response:', data);
+    
     if (!r.ok) {
-      var ej = await r.json().catch(function(){return {}});
-      throw new Error(ej.error || 'Failed to parse feed');
+      throw new Error(data.error || ('Failed to parse feed: ' + r.status));
     }
     
-    var data = await r.json();
+    if (!data.episodes || data.episodes.length === 0) {
+      throw new Error('No episodes found in this feed');
+    }
+    
     renderEpisodes(data.episodes);
     setStatus('rssStatus', 'success', '✓ Found ' + data.episodeCount + ' episodes');
     
   } catch(err) {
-    setStatus('rssStatus', 'error', '⚠ ' + esc(err.message));
+    console.error('RSS parsing error:', err);
+    var hint = '';
+    if (err.message.includes('Failed to fetch') || err.message.includes('CORS')) {
+      hint = '<br><small style="color:var(--text3);">Is backend running? Start with: node audio-downloader-server-FINAL.js</small>';
+    }
+    if (err.message.includes('No episodes')) {
+      hint = '<br><small style="color:var(--text3);">Try a different podcast feed</small>';
+    }
+    setStatus('rssStatus', 'error', '⚠ ' + esc(err.message) + hint);
   }
   
   btn.textContent = 'Load Feed'; btn.disabled = false;
@@ -866,35 +887,62 @@ document.getElementById('generateTranslinearBtn').addEventListener('click', asyn
     .filter(Boolean);
   if (!lines.length) lines = [rawText];
 
-  var prompt = 'Translate each numbered German sentence into natural English. Return ONLY valid JSON (no markdown, no extra text, no fences) with this exact structure:\n{"pairs":[{"de":"German sentence","en":"English translation"}]}\n\nSentences:\n' + lines.map(function(l,i){ return (i+1)+'. '+l; }).join('\n');
+  var prompt = 'You are a JSON translator. Translate each German sentence to English.\n\nRETURN ONLY VALID JSON. NO TEXT BEFORE OR AFTER. NO MARKDOWN FENCES.\n\nStructure (required):\n{"pairs":[{"de":"German sentence","en":"English translation"}]}\n\nGerman sentences to translate:\n' + lines.map(function(l,i){ return (i+1)+'. '+l; }).join('\n') + '\n\nRespond with ONLY the JSON object, nothing else.';
 
   try {
     var res = await claudeAPI(apiKey, prompt, 4000);
     var responseText = res.content[0].text;
     
-    // Multi-step JSON extraction
+    console.log('Claude raw response length:', responseText.length);
+    console.log('First 500 chars:', responseText.substring(0, 500));
+    
+    // Step 1: Clean up the response
     var rawJson = responseText.trim();
     
-    // Remove markdown code fences (both with and without language tag)
-    rawJson = rawJson.replace(/^```(?:json)?\s*/i, '');
-    rawJson = rawJson.replace(/```\s*$/i, '');
+    // Step 2: Remove markdown code fences (both with and without language tag)
+    rawJson = rawJson.replace(/^```(?:json)?\s*/im, '');
+    rawJson = rawJson.replace(/```\s*$/im, '');
     rawJson = rawJson.trim();
     
-    // Find the actual JSON boundaries
+    console.log('After fence removal:', rawJson.substring(0, 200));
+    
+    // Step 3: Find the FIRST { and LAST }
     var start = rawJson.indexOf('{');
-    var end   = rawJson.lastIndexOf('}');
+    var end = rawJson.lastIndexOf('}');
+    
+    console.log('Found { at:', start, '} at:', end);
     
     if (start === -1 || end === -1 || end <= start) {
-      throw new Error('No valid JSON object found in Claude response. Response was: ' + responseText.substring(0, 200));
+      // No JSON found at all - try to extract from response
+      console.error('No JSON found, raw response:', rawJson.substring(0, 500));
+      throw new Error('Claude did not return valid JSON. Response: ' + rawJson.substring(0, 300));
     }
     
     rawJson = rawJson.substring(start, end + 1);
     
-    // Attempt to parse
-    var parsed = JSON.parse(rawJson);
+    console.log('Extracted JSON:', rawJson.substring(0, 200));
     
-    // Validate structure
+    // Step 4: Attempt to parse
+    var parsed;
+    try {
+      parsed = JSON.parse(rawJson);
+      console.log('Successfully parsed JSON');
+    } catch(parseErr) {
+      console.error('JSON parse failed, attempting repair...');
+      // Try to repair common JSON issues
+      rawJson = rawJson.replace(/,\s*}/g, '}');  // Remove trailing commas
+      rawJson = rawJson.replace(/,\s*]/g, ']');  // Remove trailing commas in arrays
+      try {
+        parsed = JSON.parse(rawJson);
+        console.log('Successfully parsed repaired JSON');
+      } catch(e) {
+        throw new Error('JSON parsing failed even after repair: ' + parseErr.message);
+      }
+    }
+    
+    // Step 5: Validate structure
     if (!parsed.pairs) {
+      console.error('Missing pairs field. Got keys:', Object.keys(parsed));
       throw new Error('JSON missing "pairs" field. Got: ' + Object.keys(parsed).join(', '));
     }
     if (!Array.isArray(parsed.pairs)) {
@@ -904,12 +952,14 @@ document.getElementById('generateTranslinearBtn').addEventListener('click', asyn
       throw new Error('No sentence pairs were generated.');
     }
 
+    console.log('Validation passed. Rendering', parsed.pairs.length, 'pairs');
     renderTranscript(parsed.pairs);
     setStatus('translinearStatus','success','✓ Done! Click any German word to see its definition.');
     document.getElementById('transcriptSection').scrollIntoView({behavior:'smooth',block:'start'});
   } catch(err) {
+    console.error('Full error:', err);
     setStatus('translinearStatus','error','⚠ Error: ' + esc(err.message));
-    document.getElementById('transcriptContent').innerHTML = '<div style="color:#ff9999;padding:20px;">Error: ' + esc(err.message) + '<br><br><small style="color:var(--text3);">Tip: Check your Claude API key and try again.</small></div>';
+    document.getElementById('transcriptContent').innerHTML = '<div style="color:#ff9999;padding:20px;">Error: ' + esc(err.message) + '<br><br><small style="color:var(--text3);">Check browser console (F12) for details. The Claude API response may be malformed.</small></div>';
   }
 
   btn.textContent = 'Generate Lyrics View'; btn.disabled = false;
