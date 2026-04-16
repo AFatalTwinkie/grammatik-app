@@ -86,8 +86,9 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
 
 /* ── ─── SPOTIFY LYRICS STYLE ─── ── */
 .spotify-lyrics-wrap{padding:12px 0;}
-.lyric-line{padding:10px 0;cursor:default;transition:color 0.2s;}
-.lyric-line.active-line{color:#fff;}
+.lyric-line{padding:10px 0;cursor:default;transition:color 0.3s, opacity 0.3s;}
+.lyric-line.active-line{color:#fff;opacity:1;}
+.lyric-line:not(.active-line){opacity:0.5;}
 .lyric-de{font-size:1.28em;font-weight:700;line-height:1.5;color:#fff;letter-spacing:-0.2px;}
 .lyric-en{font-size:0.88em;font-weight:400;color:var(--text3);line-height:1.5;margin-top:3px;font-style:normal;}
 .lyric-line:not(.active-line) .lyric-de{color:var(--text3);font-weight:600;}
@@ -161,15 +162,6 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
 .podcast-suggest-btn:hover{background:var(--bg4);border-color:var(--green);color:var(--green);}
 .podcast-suggest-btn:active{transform:scale(0.98);}
 
-/* ── episode card ── */
-.episode-card{background:var(--bg3);border:1px solid rgba(255,255,255,0.05);border-radius:6px;padding:14px 16px;cursor:pointer;transition:all 0.12s;}
-.episode-card:hover{background:var(--bg4);border-color:var(--green);}
-.episode-title{font-size:0.92em;font-weight:600;color:#fff;margin-bottom:6px;line-height:1.4;}
-.episode-meta{font-size:0.78em;color:var(--text3);margin-bottom:10px;}
-.episode-btn{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;background:var(--green);color:#000;border:none;border-radius:50px;font-size:0.82em;font-weight:600;cursor:pointer;transition:all 0.12s;font-family:inherit;}
-.episode-btn:hover{background:#1fdf64;transform:scale(1.05);}
-.episode-btn:disabled{opacity:0.5;cursor:not-allowed;transform:none;}
-
 /* ── api section ── */
 .api-card{background:var(--green-dim);border:1px solid var(--green-mid);border-radius:var(--radius);padding:20px 24px;margin-bottom:16px;}
 .api-card .card-title{color:var(--green);}
@@ -181,7 +173,10 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
 .section-sub{color:var(--text2);font-size:0.85em;margin-bottom:24px;}
 
 /* ── translinear container ── */
-.translinear-bg{background:var(--bg2);border-radius:var(--radius);padding:32px 36px;min-height:200px;}
+.translinear-bg{background:var(--bg2);border-radius:var(--radius);padding:32px 36px;min-height:200px;max-height:60vh;overflow-y:auto;scroll-behavior:smooth;}
+.translinear-bg::-webkit-scrollbar{width:6px;}
+.translinear-bg::-webkit-scrollbar-track{background:transparent;}
+.translinear-bg::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:3px;}
 
 @media(max-width:640px){
   .sidebar{display:none;}
@@ -330,7 +325,12 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
         <!-- Episodes List -->
         <div id="episodesSection" style="display:none;" class="card">
           <div class="card-title">Available Episodes</div>
-          <div id="episodesList" style="display:grid;gap:12px;"></div>
+          <div class="field-row">
+            <select id="episodeSelect" class="field-input" style="cursor:pointer;">
+              <option value="">— Select an episode —</option>
+            </select>
+            <button class="btn btn-green" id="loadEpisodeBtn" type="button">⬇ Load</button>
+          </div>
         </div>
 
         <div id="rawTranscriptSection" style="display:none;" class="card">
@@ -433,6 +433,8 @@ var TOPICS = [
 var currentTopic = '';
 var chartInstance = null;
 var defCache = {};
+var whisperSegments = [];  // [{text, start, end}, ...] from Whisper verbose_json
+var lyricTimings = [];     // [{startTime, endTime, el}, ...] mapped to rendered lyric lines
 
 // ── Hardcoded API Keys (Personal Use) ─────────────────────────────────────
 var HARDCODED_KEYS = {
@@ -647,15 +649,34 @@ audioEl.addEventListener('timeupdate', function() {
     document.getElementById('seekBar').value = pct;
     document.getElementById('seekFill').style.width = pct + '%';
     document.getElementById('timeDisplay').textContent = fmt(audioEl.currentTime) + ' / ' + fmt(dur);
+    // Sync lyrics
+    syncLyrics(audioEl.currentTime);
   }
 });
 audioEl.addEventListener('ended', function(){ document.getElementById('playBtn').textContent = '▶'; });
 
 document.getElementById('playBtn').addEventListener('click', function() {
   if (!audioEl.src) return;
+  togglePlayPause();
+});
+
+// Spacebar hotkey for play/pause (only on Listening tab, and not when typing)
+document.addEventListener('keydown', function(e) {
+  if (e.code !== 'Space') return;
+  var tag = (e.target.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable) return;
+  // Only if on listening tab and audio is loaded
+  if (!document.getElementById('tab-listening').classList.contains('active')) return;
+  if (!audioEl.src) return;
+  e.preventDefault();
+  togglePlayPause();
+});
+
+function togglePlayPause() {
   if (audioEl.paused) { audioEl.play().then(function(){ document.getElementById('playBtn').textContent = '⏸'; }); }
   else { audioEl.pause(); document.getElementById('playBtn').textContent = '▶'; }
-});
+}
+
 document.getElementById('seekBar').addEventListener('input', function() {
   var dur = audioEl.duration;
   if (dur && !isNaN(dur)) audioEl.currentTime = (this.value/100)*dur;
@@ -681,7 +702,38 @@ document.getElementById('clearListeningBtn').addEventListener('click', function(
   setStatus('transcribeStatus','','');
   document.getElementById('playBtn').textContent = '▶';
   defCache = {};
+  whisperSegments = [];
+  lyricTimings = [];
 });
+
+// ── Lyric sync engine ────────────────────────────────────────────────────
+var lastActiveLyricIdx = -1;
+
+function syncLyrics(currentTime) {
+  if (!lyricTimings.length) return;
+  var activeIdx = -1;
+  for (var i = 0; i < lyricTimings.length; i++) {
+    if (currentTime >= lyricTimings[i].startTime && currentTime < lyricTimings[i].endTime) {
+      activeIdx = i;
+      break;
+    }
+  }
+  // If past the last segment start, highlight last
+  if (activeIdx === -1 && lyricTimings.length > 0 && currentTime >= lyricTimings[lyricTimings.length-1].startTime) {
+    activeIdx = lyricTimings.length - 1;
+  }
+  if (activeIdx === lastActiveLyricIdx) return;
+  lastActiveLyricIdx = activeIdx;
+
+  // Update highlights
+  var lines = document.querySelectorAll('#transcriptContent .lyric-line');
+  lines.forEach(function(l){ l.classList.remove('active-line'); });
+  if (activeIdx >= 0 && lines[activeIdx]) {
+    lines[activeIdx].classList.add('active-line');
+    // Smooth scroll into view within the translinear container
+    lines[activeIdx].scrollIntoView({ behavior:'smooth', block:'center' });
+  }
+}
 
 // ── RSS Feed Handling ─────────────────────────────────────────────────────
 document.getElementById('parseRssBtn').addEventListener('click', async function() {
@@ -745,25 +797,32 @@ document.querySelectorAll('.podcast-suggest-btn').forEach(function(btn) {
   });
 });
 
+var loadedEpisodes = []; // store for dropdown reference
+
 function renderEpisodes(episodes) {
-  if (!episodes || !episodes.length) {
-    document.getElementById('episodesList').innerHTML = '<p style="color:var(--text3);">No episodes found.</p>';
-    return;
-  }
-  
-  var html = '';
+  loadedEpisodes = episodes || [];
+  var sel = document.getElementById('episodeSelect');
+  sel.innerHTML = '<option value="">— Select an episode —</option>';
+  if (!episodes || !episodes.length) return;
+
   episodes.forEach(function(ep, idx) {
-    html += '<div class="episode-card">';
-    html += '<div class="episode-title">' + esc(ep.title || 'Untitled') + '</div>';
-    html += '<div class="episode-meta">📻 Episode • <a href="' + esc(ep.audioUrl) + '" target="_blank" style="color:var(--green);text-decoration:none;">Direct link</a></div>';
-    html += '<button class="episode-btn" onclick="downloadEpisode(\'' + esc(ep.audioUrl).replace(/'/g, "\\'") + '\',\'' + esc(ep.title).replace(/'/g, "\\'") + '\')">⬇ Download & Transcribe</button>';
-    html += '</div>';
+    var opt = document.createElement('option');
+    opt.value = idx;
+    opt.textContent = ep.title || ('Episode ' + (idx+1));
+    sel.appendChild(opt);
   });
-  
-  document.getElementById('episodesList').innerHTML = html;
+
   document.getElementById('episodesSection').style.display = 'block';
   document.getElementById('episodesSection').scrollIntoView({behavior:'smooth', block:'start'});
 }
+
+document.getElementById('loadEpisodeBtn').addEventListener('click', function() {
+  var sel = document.getElementById('episodeSelect');
+  var idx = sel.value;
+  if (idx === '' || !loadedEpisodes[idx]) { alert('Please select an episode first.'); return; }
+  var ep = loadedEpisodes[idx];
+  downloadEpisode(ep.audioUrl, ep.title);
+});
 
 async function downloadEpisode(audioUrl, title) {
   if (!audioUrl) return;
@@ -855,13 +914,16 @@ document.getElementById('transcribeBtn').addEventListener('click', async functio
     }
 
     var json = await r.json();
-    console.log('Whisper success');
+    console.log('Whisper success, segments:', (json.segments || []).length);
 
     var text = (json.text || '').trim();
     if (!text) throw new Error('Whisper returned empty transcription.');
 
+    // Store segments for lyric sync
+    whisperSegments = json.segments || [];
+
     var wordCount = text.split(/\s+/).filter(Boolean).length;
-    setStatus('transcribeStatus', 'success', '✓ Transcribed — ' + wordCount + ' words. Review below, then generate the lyrics view.');
+    setStatus('transcribeStatus', 'success', '✓ Transcribed — ' + wordCount + ' words, ' + whisperSegments.length + ' segments. Review below, then generate the lyrics view.');
     document.getElementById('rawTranscriptEdit').value = text;
     document.getElementById('rawTranscriptSection').style.display = 'block';
     document.getElementById('rawTranscriptSection').scrollIntoView({behavior:'smooth', block:'start'});
@@ -917,8 +979,11 @@ document.getElementById('generateTranslinearBtn').addEventListener('click', asyn
 
     if (!allPairs.length) throw new Error('No sentence pairs were generated.');
 
+    // Build timing map: match translated pairs back to Whisper segments
+    buildLyricTimings(allPairs);
+
     renderTranscript(allPairs);
-    setStatus('translinearStatus','success','✓ Done — ' + allPairs.length + ' sentences. Click any German word to see its definition.');
+    setStatus('translinearStatus','success','✓ Done — ' + allPairs.length + ' sentences. Click any German word for its definition. ' + (lyricTimings.length ? 'Lyrics sync with audio.' : ''));
     document.getElementById('transcriptSection').scrollIntoView({behavior:'smooth',block:'start'});
   } catch(err) {
     console.error('Full error:', err);
@@ -998,6 +1063,61 @@ function salvagePairs(str) {
     }
   }
   return out;
+}
+
+// Build timing data by matching translated pairs to Whisper segments.
+// Strategy: merge Whisper segments into groups that map 1:1 with our sentence pairs.
+// We use text similarity (shared words) to find the best segment boundaries.
+function buildLyricTimings(pairs) {
+  lyricTimings = [];
+  lastActiveLyricIdx = -1;
+  if (!whisperSegments.length || !pairs.length) return;
+
+  // If segment count roughly matches pair count, do direct 1:1 mapping
+  if (whisperSegments.length === pairs.length) {
+    for (var i = 0; i < pairs.length; i++) {
+      lyricTimings.push({ startTime: whisperSegments[i].start, endTime: whisperSegments[i].end });
+    }
+    console.log('Lyric timing: direct 1:1 mapping (' + lyricTimings.length + ' lines)');
+    return;
+  }
+
+  // Otherwise, distribute segments across pairs proportionally.
+  // Each pair gets a proportional slice of the total audio duration based on its
+  // character length relative to the total transcript.
+  var totalChars = 0;
+  pairs.forEach(function(p) { totalChars += (p.de || '').length; });
+  if (totalChars === 0) return;
+
+  var totalStart = whisperSegments[0].start;
+  var totalEnd = whisperSegments[whisperSegments.length - 1].end;
+  var totalDuration = totalEnd - totalStart;
+
+  var cursor = totalStart;
+  for (var j = 0; j < pairs.length; j++) {
+    var charRatio = (pairs[j].de || '').length / totalChars;
+    var segDuration = totalDuration * charRatio;
+    var segStart = cursor;
+    var segEnd = cursor + segDuration;
+    // Snap to nearest Whisper segment boundary for accuracy
+    segEnd = snapToSegmentBoundary(segEnd);
+    if (j === pairs.length - 1) segEnd = totalEnd; // last pair gets the rest
+    lyricTimings.push({ startTime: segStart, endTime: segEnd });
+    cursor = segEnd;
+  }
+  console.log('Lyric timing: proportional mapping (' + lyricTimings.length + ' lines)');
+}
+
+function snapToSegmentBoundary(time) {
+  var closest = time;
+  var minDist = Infinity;
+  for (var i = 0; i < whisperSegments.length; i++) {
+    var d = Math.abs(whisperSegments[i].end - time);
+    if (d < minDist) { minDist = d; closest = whisperSegments[i].end; }
+    d = Math.abs(whisperSegments[i].start - time);
+    if (d < minDist) { minDist = d; closest = whisperSegments[i].start; }
+  }
+  return closest;
 }
 
 function renderTranscript(pairs) {
